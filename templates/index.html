@@ -61,7 +61,12 @@
   <body>
     <div class="container">
       <h2>🏏 AI WCC3 Highlight Generator</h2>
-      <form action="/upload" method="post" enctype="multipart/form-data">
+      <form
+        id="uploadForm"
+        action="/upload"
+        method="post"
+        enctype="multipart/form-data"
+      >
         <input type="file" name="video" required />
         <br /><br />
         <div
@@ -75,6 +80,32 @@
           </label>
           <br />
         </div>
+        <video
+          id="resultVideo"
+          controls
+          style="margin-top: 20px; width: 100%; display: none"
+        ></video>
+        <script>
+          document.getElementById("uploadForm").onsubmit = async (e) => {
+            e.preventDefault();
+
+            const formData = new FormData(e.target);
+            const res = await fetch("/upload", {
+              method: "POST",
+              body: formData,
+            });
+            const data = await res.json();
+            if (data.error) {
+              alert(data.error);
+              return;
+            }
+            if (data.video_url) {
+              const video = document.getElementById("resultVideo");
+              video.src = data.video_url;
+              video.style.display = "block";
+            }
+          };
+        </script>
         <br />
         <button type="submit">🚀 Generate Highlights</button>
       </form>

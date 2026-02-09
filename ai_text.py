@@ -44,7 +44,7 @@ def get_event_text(label):
     #         "GAME ON!",
     #         "PRESSURE BUILDING!"
     #     ])
-def add_ai_text_to_clips(clips):
+def add_ai_text_to_clips(clips,run_folder):
     
     # Adds AI-style text overlays (supers) on highlight clips.
 
@@ -104,7 +104,7 @@ def add_ai_text_to_clips(clips):
         # Combine video + text
         final_video = CompositeVideoClip([video, text_clip])
 
-        output_path = f"outputs/final_video_{i+1}.mp4"
+        output_path = os.path.join(run_folder, f"text_{i+1}.mp4")
 
         # Save final video
         final_video.write_videofile(output_path, codec="libx264", audio_codec="aac")

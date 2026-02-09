@@ -47,8 +47,10 @@ def detect_scene_changes(video_path):
     print(" Found", len(highlight_times), "scene based highlights")
     return highlight_times
 
-def cut_highlight_clips(video_path, highlight_times):
-    highlight_times = detect_scene_changes(video_path)
+def cut_highlight_clips(video_path, highlight_times,run_folder):
+    scene_times = detect_scene_changes(video_path)
+    if scene_times:
+        highlight_times.extend(scene_times)
     
     # This function cuts small video clips around the highlight times
     # Parameters:
@@ -74,17 +76,12 @@ def cut_highlight_clips(video_path, highlight_times):
         print(h)
     # Loop through each highlight time
     for i, (start, end, label) in enumerate(highlight_times):
-        print(f"DEBUG: start={start}, end={end}, label={label}")
-
-        # # We take 3 seconds before and after highlight
-        # start_time = highlight_time - 3
-        # end_time = highlight_time + 3
-
-        # Make sure times are inside video duration
-        # if start_time < 0:
-        #     start_time = 0
-        # if end_time > video.duration:
-        #     end_time = video.duration
+        duration = end - start
+        print(f"✂️ Attempting clip {i}: {start} → {end} ({duration:.2f}s)")
+        # print(f"DEBUG: start={start}, end={end}, label={label}")
+        if duration < 2:
+            print("⚠️ Skipping clip: too short")
+            continue
         start = max(0, start)
         end = min(video.duration, end)
         if end-start < 1:
@@ -99,7 +96,7 @@ def cut_highlight_clips(video_path, highlight_times):
         small_clip = video.subclipped(start, end)
 
         # Output file name
-        output_name = f"outputs/highlight_{i+1}.mp4"
+        output_name = os.path.join(run_folder, f"highlight_{i+1}.mp4")
 
         # Save the clip
         small_clip.write_videofile(output_name, codec="libx264", audio_codec="aac", logger=None)
@@ -123,8 +120,15 @@ def get_video_duration(video_path):
 def merge_clips(clip_paths, output_path, target_size):
     clips = []
     for c in clip_paths:
-        clip = VideoFileClip(c).resized(target_size)
-        clips.append(clip)
+        if os.path.exists(c) and os.path.getsize(c) > 0:
+            try:
+                clip = VideoFileClip(c).resized(target_size)
+                clips.append(clip)
+                print(f"✅ Saved clip: {c}")
+            except Exception as e:
+                print(f" Failed to load clip {c}: {e}")
+    if not clips:
+        raise ValueError("No valid clips to merge after loading")
     final = concatenate_videoclips(clips, method="compose")
 
     final.write_videofile(
