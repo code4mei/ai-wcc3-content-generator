@@ -129,7 +129,7 @@ def merge_clips(clip_paths, output_path, target_size):
                 print(f" Failed to load clip {c}: {e}")
     if not clips:
         raise ValueError("No valid clips to merge after loading")
-    final = concatenate_videoclips(clips, method="compose")
+    final = concatenate_videoclips(clips, method="chain")
 
     final.write_videofile(
         output_path,

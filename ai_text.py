@@ -94,7 +94,7 @@ def add_ai_text_to_clips(clips,run_folder):
             color='yellow',      
             stroke_color='black',
             stroke_width=3,
-            # method='caption',         # better rendering
+            method='label',         # better rendering
             size=video.size            # match video size
         )
 
