@@ -4,8 +4,42 @@ import numpy as np
 import pytesseract
 import re
 from flask import request
+import librosa
+from faster_whisper import WhisperModel
+import mediapipe as mp
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+def detect_scoreboard(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 80, 200)
+
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180,
+        threshold=100,
+        minLineLength=100,
+        maxLineGap=10
+    )
+
+    if lines is None:
+        return False
+
+    horizontal = 0
+    vertical = 0
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if abs(y1 - y2) < 10:
+            horizontal += 1
+        if abs(x1 - x2) < 10:
+            vertical += 1
+
+    # Threshold tuning
+    if horizontal > 10 and vertical > 5:
+        return True
+
+    return False
 
 def parse_score(score_text):
     """
@@ -17,108 +51,50 @@ def parse_score(score_text):
         wickets = int(match.group(2))
         return runs, wickets
     return None, None
+# ----------------------------
+# TRANSCRIPTION USING WHISPER
+# ----------------------------
+def transcribe_audio(video_path):
+    audio_path = video_path.replace(".mp4", "_temp_audio.wav")
 
-'''
-# def find_highlights(video_path):
-    """
-    Detect cricket highlights based on scoreboard OCR + optional audio/motion filters
-
-    Returns:
-        list of highlights → [(start_time, end_time, label), ...]
-    """
-
-    print("Analyzing video for highlights...")
-
+    # Extract clean mono audio
     video = VideoFileClip(video_path)
-    # audio = video.audio
-    duration = int(video.duration)
-    cool_down = 0
-    # previous_volume = 0
+    video.audio.write_audiofile(audio_path, fps=16000, nbytes=2, codec='pcm_s16le')
+    video.close()
 
-    highlight_times = []
-    cap = cv2.VideoCapture(video_path)
-    previous_frame = None  #compare frames to measure motion
-    prev_scoreboard = None
-    # frame_count = 0
-    # fps = cap.get(cv2.CAP_PROP_FPS)
+    model = WhisperModel("base", device="cpu",compute_type="float32")  # change to cuda if GPU
+    segments, _ = model.transcribe(audio_path)
 
+    transcript_segments = []
+    for segment in segments:
+        transcript_segments.append({
+            "start": segment.start,
+            "end": segment.end,
+            "text": segment.text.strip(),
+            "word_count": len(segment.text.split())
+        })
 
-    for t in range(0, duration, 1): # check every second
-        if cool_down > 0:
-            cool_down -= 1
-            # previous_volume = volume if 'volume' in locals() else previous_volume
+    return transcript_segments
+
+def get_speech_peaks(transcript_segments, window_size=4):
+    """
+    Detect excitement via speech speed increase
+    Returns timestamps where speech is fast
+    """
+    speech_peaks = []
+
+    for segment in transcript_segments:
+        duration = segment["end"] - segment["start"]
+        if duration <= 0:
             continue
 
-        #video frame
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)  # go to second t
-        success, frame = cap.read()
-        if not success:
-            continue
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        motion_score = 0
-        # # hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        # # lower_green = np.array([35, 40, 40])
-        # # upper_green = np.array([85, 255, 255])
-        # # mask = cv2.inRange(hsv, lower_green, upper_green)
-        # # green_ratio = np.sum(mask>0) / (frame.shape[0] * frame.shape[1])
-        if previous_frame is not None:
-            diff = cv2.absdiff(gray, previous_frame)
-            motion_score = diff.sum() / (frame.shape[0] * frame.shape[1])  # normalize
-        previous_frame = gray
+        wps = segment["word_count"] / duration
 
-        
-        h, w, _ = frame.shape
-        scoreboard = frame[int(0.75*h):h, int(0.2*w):int(0.8*w)]
-        gray_scoreboard = cv2.cvtColor(scoreboard, cv2.COLOR_BGR2GRAY)
-        # gray = cv2.GaussianBlur(gray_scoreboard, (3,3), 0)
-        _, thresh = cv2.threshold(gray_scoreboard, 150, 255, cv2.THRESH_BINARY)
-        # score_change = 0
-        # OCR to detect score
-        score_text = pytesseract.image_to_string(thresh, config='--psm 7')
-        score_text = score_text.strip().replace(" ", "").replace("\n", "")
-        nums = re.findall(r'\d+', score_text)
-        runs, wickets = None, None
-        if len(nums) >= 2:
-            runs = int(nums[0])
-            wickets = int(nums[1])
-        else:
-            runs,wickets = None, None
-        label = None
-        if prev_scoreboard and runs is not None and wickets is not None:
-            prev_runs, prev_wickets = prev_scoreboard
-            run_diff = (runs - prev_runs) if runs is not None else 0
-            wicket_diff = (wickets - prev_wickets) if wickets is not None else 0
+        # If speech faster than threshold → possible excitement
+        if wps > 3.5:   # tune this
+            speech_peaks.append(segment["start"])
 
-            if wicket_diff > 0:
-                label = f"WICKET! ({prev_wickets}→{wickets})"
-            elif run_diff >= 6:
-                label = f"SIX! (+{run_diff})"
-            elif run_diff == 4:
-                label = f"BOUNDARY! (+{run_diff})"
-            elif run_diff > 0:
-                label = f"RUN (+{run_diff})"
-
-            if motion_score > 15 and label is None:  # adjust threshold if too sensitive
-                label = "Exciting Moment"
-            if label:
-                start = max(t - 2, 0)
-                end = min(t + 5, duration)
-                highlight_times.append((start, end, label))
-                cool_down = 3  # avoid double counting nearby frames
-        if runs is not None and wickets is not None:
-            prev_scoreboard = (runs, wickets)
-
-        # prev_score = (runs, wickets)
-        # if volume_change > 0.05 and motion_score > 4 and score_change > 8:  # threshold for high energy, motion, and score change
-        #         highlight_times.append((t, min(t+5, duration), volume))
-        #         cool_down = 8  # 8 seconds cool-down to avoid multiple detections
-    cap.release()
-    video.close()  # middle of the chunk
-    print(f"Found {len(highlight_times)} highlights.")
-    for h in highlight_times:
-        print(h)
-    # print(f"Time: {t}s | Volume: {round(volume,3)} | Motion: {round(motion_score,2)}")
-    return highlight_times '''
+    return speech_peaks
 
 def get_audio_peaks(video_path, window_size=0.5, threshold=0.05):
     """
@@ -141,7 +117,20 @@ def get_audio_peaks(video_path, window_size=0.5, threshold=0.05):
     print(f"DEBUG: max audio_peak={max(times) if times else 'none'}")
     video.close()
     return times
+    
+    mp_face = mp.solutions.face_detection
+    face_detection = mp_face.FaceDetection()
+    cap = cv2.VideoCapture("clip.mp4")
 
+    ret, frame = cap.read()
+    results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+    if results.detections:
+        bbox = results.detections[0].location_data.relative_bounding_box
+    x = bbox.xmin
+    y = bbox.ymin
+    w = bbox.width
+    h = bbox.height
 
 def get_visual_peaks(video_path, threshold=25):
     """
@@ -215,7 +204,7 @@ def get_ocr_peaks(video_path):
     cap.release()
     return peaks
 
-def merge_peaks(audio_times, visual_times, ocr_times, video_duration):
+def merge_peaks(audio_times, visual_times, ocr_times,speech_times, video_duration):
     """
     Merge audio and visual peaks into final highlight timestamps
     Returns list of tuples: (start_time, end_time)
@@ -236,6 +225,8 @@ def merge_peaks(audio_times, visual_times, ocr_times, video_duration):
 
     for t in ocr_times:
         candidates.append((t, 0.95, "score_change"))   # score change = VERY strong
+    for t in speech_times:
+        candidates.append((t, 0.85, "speech_excitement"))
     # Fallback so system never returns empty
     if not candidates and audio_times:
         print(" No strong detections — using audio fallback")
@@ -327,6 +318,32 @@ def find_highlights(video_path):
     """
     print("Analyzing video for highlights...")
 
+    cap = cv2.VideoCapture(video_path)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+
+    scoreboard_frames = 0
+    checked_frames = 0
+
+    for i in range(0, frame_count, int(fps)):  # 1 frame per second
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        checked_frames += 1
+        if detect_scoreboard(frame):
+            scoreboard_frames += 1
+
+    cap.release()
+
+    scoreboard_ratio = scoreboard_frames / max(1, checked_frames)
+
+    if scoreboard_ratio > 0.3:
+        layout_mode = "contain"
+    else:
+        layout_mode = "verticalCrop"
+    
     video = VideoFileClip(video_path)
     video_duration = video.duration
     print(f"DEBUG: video.duration={video_duration}")
@@ -335,11 +352,18 @@ def find_highlights(video_path):
     visual_frames, fps = get_visual_peaks(video_path)
     visual_times = [f / fps for f in visual_frames]
     ocr_times = get_ocr_peaks(video_path)
+    # NEW AI TRANSCRIPTION
+    print("Running Whisper transcription...")
+    transcript_segments = transcribe_audio(video_path)
+
+    # NEW speech excitement detection
+    speech_peaks = get_speech_peaks(transcript_segments)
+    print(f"Speech peaks detected: {len(speech_peaks)}")
     print(f"DEBUG: max audio_peak={max(audio_peaks) if audio_peaks else 'none'}")
     print(f"DEBUG: max visual_time={max(visual_times) if visual_times else 'none'}")
     print(f"DEBUG: max ocr_time={max(ocr_times) if ocr_times else 'none'}")
     print(f"DEBUG: video.duration={video_duration}")
-    highlight_times = merge_peaks(audio_peaks, visual_times, ocr_times, video_duration)
+    highlight_times = merge_peaks(audio_peaks, visual_times, ocr_times,speech_peaks, video_duration)
 
     print(f"Found {len(highlight_times)} highlights.")
     for idx, (start, end, label) in enumerate(highlight_times, 1):
@@ -349,4 +373,4 @@ def find_highlights(video_path):
         print(h)
 
     video.close()
-    return highlight_times
+    return highlight_times,layout_mode

@@ -5,8 +5,12 @@ env/
 # Python cache
 __pycache__/
 *.pyc
-
+node_modules/
+.claude/
+dist/
+out/
 # Output videos
+uploads/
 outputs/
 *.mp4
 
@@ -18,3 +22,6 @@ outputs/
 
 #ignore test files
 tests/
+
+remotion-renderer/node_modules/
+remotion-renderer/out/

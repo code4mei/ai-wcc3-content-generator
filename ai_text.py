@@ -1,117 +1,153 @@
-from moviepy import VideoFileClip, TextClip, CompositeVideoClip, concatenate_videoclips
-# from moviepy.video.io.VideoFileClip import VideoFileClip
-# from moviepy.video.VideoClip import TextClip
-# from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
-# from moviepy.video.compositing.CompositeVideoClip import concatenate_videoclips
-# import cv2
-import numpy as np
-import random
+from moviepy import VideoFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
 import os
+import random
+import re
+from collections import Counter
 
-# from numpy.core.fromnumeric import clip
- 
-def get_event_text(label):
-    if label == "six":
-        return "MASSIVE SIX!"
-    elif label == "four":
-        return "CRISP FOUR!"
-    elif label == "wicket":
-        return "WICKET DOWN!"
-    elif label == "crowd":
-        return "WHAT A MOMENT!"
+STOPWORDS = {
+    "the", "a", "an", "is", "was", "were", "that",
+    "this", "to", "of", "and", "it", "in", "on",
+    "for", "with", "as", "at", "by", "from"
+}
+
+HIGH_ENERGY_WORDS = [
+    "oh", "wow", "what", "unbelievable",
+    "incredible", "no way", "insane",
+    "massive", "huge", "gone", "finish",
+    "knockout", "goal", "out", "score"
+]
+
+LOW_ENERGY_WORDS = [
+    "build up", "defensive", "waiting",
+    "holding", "passing", "strategy"
+]
+def detect_energy_level(text):
+    text_lower = text.lower()
+
+    high_hits = sum(word in text_lower for word in HIGH_ENERGY_WORDS)
+    low_hits = sum(word in text_lower for word in LOW_ENERGY_WORDS)
+
+    if high_hits >= 2:
+        return "high"
+    elif low_hits >= 2:
+        return "low"
     else:
-        return "TENSE BUILD-UP!"
-    # Volume = average audio loudness of the clip
-    # if label == "score_change":
-    #     return random.choice([
-    #         "IT'S A BOUNDARY!",
-    #         "FOUR RUNS!",
-    #         "WHAT A SHOT!",
-    #         "SMASHED!"
-    #     ])
+        return "medium"
 
-    # elif label == "crowd":
-    #     return random.choice([
-    #         "MASSIVE SIX!",
-    #         "OUT OF THE PARK!",
-    #         "UNBELIEVABLE SIX!",
-    #         "MAXIMUM!"
-    #     ])
+def extract_transcript_for_clip(transcript_segments, start_time, end_time):
+    """
+    Extract transcript text within highlight time range
+    """
+    clip_text = []
+    PRE_ROLL = 0.8   # capture buildup
+    POST_ROLL = 0.2  # slight cushion
 
-    # else:
-    #     return random.choice([
-    #         "BIG MOMENT!",
-    #         "GAME ON!",
-    #         "PRESSURE BUILDING!"
-    #     ])
-def add_ai_text_to_clips(clips,run_folder):
+    adjusted_start = start_time - PRE_ROLL
+    adjusted_end = end_time + POST_ROLL
+
+    for segment in transcript_segments:
+        seg_start = segment["start"]
+        seg_end = segment["end"]
+
+        # If segment overlaps with highlight window
+        if seg_start < adjusted_end and seg_end > adjusted_start:
+            clip_text.append(segment["text"].strip())
+
+    return " ".join(clip_text)
+
+def generate_caption_from_text(text):
+    """
+    Simple smart caption generator
+    """
+    if not text:
+        return None
+    # Split into sentences
+    sentences = re.split(r"[.!?]", text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    if not sentences:
+        return None
+
+    # Score sentences
+    sentence_scores = []
+    for s in sentences:
+        words = re.findall(r"\b\w+\b", s.lower())
+        filtered = [w for w in words if w not in STOPWORDS]
+
+        if not filtered:
+            continue
+
+        score = 0
+        freq = Counter(filtered)
+
+        for w in filtered:
+            score += len(w) * 0.3
+            score += freq[w] * 1.5
+
+        sentence_scores.append((s, score))
+
+    if not sentence_scores:
+        return None
+
+    # Pick highest scoring sentence
+    best_sentence = sorted(sentence_scores, key=lambda x: x[1], reverse=True)[0][0]
+
+    # Trim to max 6 words for punchiness
+    words = best_sentence.split()
+    short_phrase = " ".join(words[:6]).upper()
+
+    # Highlight 1–2 longest words
+    cleaned_words = re.findall(r"\b\w+\b", best_sentence)
+    longest = sorted(cleaned_words, key=len, reverse=True)[:2]
+    highlights = [w.upper() for w in longest]
+
+    return {
+        "text": short_phrase,
+        "highlights": highlights
+    }
     
-    # Adds AI-style text overlays (supers) on highlight clips.
+def process_clips(clips, run_folder, transcript_segments):
+    """
+    Apply cinematic effects (slow-mo) to clips.
+    Generate AI captions from transcript.
+    Returns list of (output_path, label, text) tuples.
+    """
+    processed = []
 
-    # Parameters:
-    #     clip_paths (list) → list of highlight clip file paths
+    for i, clip_data in enumerate(clips):
 
-    # Returns:
-    #     list of final video paths
-    # Possible cricket highlight texts
+        # If clips include timing info
+        if len(clip_data) == 4:
+            clip_path, label, start_time, end_time = clip_data
+        else:
+            # fallback if timing not included
+            clip_path, label = clip_data
+            start_time = 0
+            end_time = 0
 
-    final_video_paths = []
-
-    # Loop through each highlight clip
-    for i, (clip_path,label) in enumerate(clips):
         video = VideoFileClip(clip_path)
-        # audio = video.audio
-        # samples = audio.to_soundarray(fps=44100) #audio loudness analysis at 44.1kHz
-        # volume = np.mean(np.abs(samples))  # get average volume of audio
-        # print(f"DEBUG volume for clip {i+1}: {volume}")
 
-        # Create text overlay
-        text = get_event_text(label)
+        # Extract transcript for this highlight
+        clip_text = extract_transcript_for_clip(
+            transcript_segments,
+            start_time,
+            end_time
+        )
 
-        #cinematic effects
-        # Slow motion first 2 seconds
+        # Generate smart caption
+        text = generate_caption_from_text(clip_text)
+        # Slow motion for big shots
         if label in ["six", "four"]:
             slow_part = video.subclipped(0, min(1.5, video.duration)).with_speed_scaled(0.7)
-        # Normal rest of clip
             normal_part = video.subclipped(min(1.5, video.duration), video.duration)
             video = concatenate_videoclips([slow_part, normal_part])
 
-        # Smooth zoom-in effect
-        # def zoom_in(frame, t):
-        #     h, w = frame.shape[:2]
-        #     zoom = 1 + 0.08 * t  # gradual zoom
-        #     new_w, new_h = int(w/zoom), int(h/zoom)
-        #     x1 = (w - new_w)//2
-        #     y1 = (h - new_h)//2
-        #     frame = frame[y1:y1+new_h, x1:x1+new_w]
-        #     return cv2.resize(frame, (w, h))
-        # video = video.with_frame_processor(zoom_in)
-        # video = video.resized(lambda t: 1 + 0.05 * t)
-        text_clip = TextClip(
-            text=text,
-            font='C:/Windows/Fonts/arialbd.ttf',                
-            font_size=60,
-            color='yellow',      
-            stroke_color='black',
-            stroke_width=3,
-            method='label',         # better rendering
-            size=video.size            # match video size
-        )
+        video = CompositeVideoClip([video])
 
-        # Position text in center and match video duration
-        text_clip = text_clip.with_position("center","bottom").with_duration(video.duration)
-
-        # Combine video + text
-        final_video = CompositeVideoClip([video, text_clip])
-
-        output_path = os.path.join(run_folder, f"text_{i+1}.mp4")
-
-        # Save final video
-        final_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
-
-        final_video_paths.append(output_path)
+        output_path = os.path.join(run_folder, f"clip_{i+1}.mp4")
+        video.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None,
+                              ffmpeg_params=["-movflags", "+faststart", "-pix_fmt", "yuv420p"])
+        processed.append((output_path, label, text))
 
         video.close()
-        final_video.close()
 
-    return final_video_paths
+    return processed

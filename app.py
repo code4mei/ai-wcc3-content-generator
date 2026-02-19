@@ -1,8 +1,9 @@
 from flask import Flask, request, jsonify, render_template,send_from_directory
 import os
-from video_analyzer import find_highlights
-from effects_engine import cut_highlight_clips,merge_clips
-from ai_text import add_ai_text_to_clips
+from video_analyzer import find_highlights, transcribe_audio
+from effects_engine import cut_highlight_clips,create_reel_json,render_with_remotion,copy_to_public_folder
+from ai_text import process_clips
+import json
 
 app = Flask(__name__)
 
@@ -48,43 +49,37 @@ def upload_video():
     os.makedirs(run_folder)
     print(f"📁 Created run folder: {run_folder}", flush=True)
     # 🔹 Step 1: Detect highlights
-    highlight_times = find_highlights(video_path)
+    highlight_times,layout_mode = find_highlights(video_path)
 
     if not highlight_times:
         return jsonify({"message": "No highlights detected"}), 200
+    print("🧠 Generating transcript...")
+    transcript_segments = transcribe_audio(video_path)
 
+    # Save transcript to run folder
+    transcript_path = os.path.join(run_folder, "transcript.json")
+    with open(transcript_path, "w") as f:
+        json.dump(transcript_segments, f, indent=4)
+    print(f"Transcript saved at {transcript_path}")
     # 🔹 Step 2: Cut highlight clips
     clips = cut_highlight_clips(video_path,highlight_times,run_folder)
+    # 🔹 Step 3: Process clips (slow-mo effects)
+    final_videos = process_clips(clips, run_folder,transcript_segments)
+    #Create reel.json with clip metadata for Remotion
+    create_reel_json(run_folder, clip_metadata=final_videos, layout_mode=layout_mode)
+    #copy to remotion folder
+    # remotion_public_folder = "C:\Users\1102\remotion-project\public\clips"
+    copy_to_public_folder(run_folder)
+    #render only once
+    render_with_remotion(run_folder)
 
-    # 🔹 Step 3: Add AI text overlays
-    
-    final_videos = add_ai_text_to_clips(clips,run_folder)
-    
-    format_type = request.form.get("format", "reel")
-    print(f"Requested format: {format_type}", flush=True)
-    final_output = os.path.join(run_folder, "final_output.mp4")
-    if format_type == "reel":
-        target_size = (1080, 1920)   # 9:16
-        final_output = f"{run_folder}/final_reel.mp4"
-    else:
-        target_size = (1920, 1080)   # 16:9
-        final_output = f"{run_folder}/final_youtube_video.mp4"
+    final_output = os.path.join(run_folder, "final_reel_remotion.mp4")
     print("Final videos:", final_videos, flush=True)
-    try:
-      merge_clips(
-          clip_paths=final_videos,
-          output_path=final_output,
-          target_size=target_size
-      )
-    except ValueError as e:
-        return jsonify({
-            "error": str(e),
-            "message": "Highlight generation failed"
-        }), 400
+
     return jsonify({
         "message": "Video generated successfully!",
         "final_output": final_output,
-        "video_url": f"/outputs/{os.path.basename(run_folder)}/{os.path.basename(final_output)}"
+        "video_url": f"/outputs/{os.path.basename(run_folder)}/final_reel_remotion.mp4"
     })
 
 @app.route("/outputs/<path:filename>")
