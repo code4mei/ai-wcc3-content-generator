@@ -1,68 +1,124 @@
 import cv2
-from moviepy.video.io.VideoFileClip import VideoFileClip    
+from moviepy.video.io.VideoFileClip import VideoFileClip
 import numpy as np
 import pytesseract
 import re
-from flask import request
+import os
 import librosa
 from faster_whisper import WhisperModel
-import mediapipe as mp
+import config
 
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+if config.TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = config.TESSERACT_CMD
+
+
+# ──────────────────────────────────────────────
+# Scoreboard / overlay detection
+# ──────────────────────────────────────────────
+
 def detect_scoreboard(frame):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 80, 200)
+    """
+    Detect scoreboard / player-sheet overlay using three fast signals:
+      1. Low green-field ratio  -> overlay covers the field
+      2. High edge density in top or bottom band -> structured graphics / text
+      3. Relaxed Hough-line check -> rectangular overlay borders
+    Returns True if any signal fires.
+    """
+    h, w = frame.shape[:2]
 
-    lines = cv2.HoughLinesP(
-        edges,
-        rho=1,
-        theta=np.pi / 180,
-        threshold=100,
-        minLineLength=100,
-        maxLineGap=10
-    )
-
-    if lines is None:
-        return False
-
-    horizontal = 0
-    vertical = 0
-
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        if abs(y1 - y2) < 10:
-            horizontal += 1
-        if abs(x1 - x2) < 10:
-            vertical += 1
-
-    # Threshold tuning
-    if horizontal > 10 and vertical > 5:
+    # Signal 1: green-field ratio (HSV)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv, (35, 40, 40), (85, 255, 255))
+    green_ratio = np.sum(green_mask > 0) / (h * w)
+    if green_ratio < config.SCOREBOARD_GREEN_RATIO:
         return True
+
+    # Signal 2: edge density in top / bottom third
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    for region in [gray[: h // 3, :], gray[2 * h // 3 :, :]]:
+        edges = cv2.Canny(region, 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        if edge_density > config.SCOREBOARD_EDGE_DENSITY:
+            return True
+
+    # Signal 3: Hough-line fallback
+    full_edges = cv2.Canny(gray, 80, 200)
+    lines = cv2.HoughLinesP(
+        full_edges, 1, np.pi / 180,
+        threshold=config.SCOREBOARD_HOUGH_THRESHOLD,
+        minLineLength=config.SCOREBOARD_HOUGH_MIN_LENGTH,
+        maxLineGap=config.SCOREBOARD_HOUGH_MAX_GAP,
+    )
+    if lines is not None:
+        horiz = sum(1 for l in lines if abs(l[0][1] - l[0][3]) < 10)
+        vert = sum(1 for l in lines if abs(l[0][0] - l[0][2]) < 10)
+        if horiz > config.SCOREBOARD_HORIZ_LINES and vert > config.SCOREBOARD_VERT_LINES:
+            return True
 
     return False
 
+
+def detect_clip_layout(clip_path):
+    """
+    Check if a single clip contains scoreboard/player sheet.
+    Samples several frames and returns "contain" if scoreboard
+    is found in any significant portion, else "verticalCrop".
+    """
+    cap = cv2.VideoCapture(clip_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    if frame_count == 0 or fps == 0:
+        cap.release()
+        return "verticalCrop"
+
+    step = max(1, frame_count // 5)
+    scoreboard_hits = 0
+    checked = 0
+
+    for i in range(0, frame_count, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        checked += 1
+        if detect_scoreboard(frame):
+            scoreboard_hits += 1
+
+    cap.release()
+
+    if checked > 0 and scoreboard_hits > 0:
+        print(f"  Scoreboard detected in {clip_path}: {scoreboard_hits}/{checked} frames")
+        return "contain"
+    return "verticalCrop"
+
+
+# ──────────────────────────────────────────────
+# Score parsing & OCR
+# ──────────────────────────────────────────────
+
 def parse_score(score_text):
-    """
-    Parse score string like '125/3' into runs and wickets
-    """
+    """Parse score string like '125/3' into (runs, wickets)."""
     match = re.match(r'(\d+)/(\d+)', score_text)
     if match:
-        runs = int(match.group(1))
-        wickets = int(match.group(2))
-        return runs, wickets
+        return int(match.group(1)), int(match.group(2))
     return None, None
-# ----------------------------
-# TRANSCRIPTION USING WHISPER
-# ----------------------------
-def transcribe_audio(video_path):
-    audio_path = video_path.replace(".mp4", "_temp_audio.wav")
 
-    # Extract clean mono audio
+
+# ──────────────────────────────────────────────
+# Transcription
+# ──────────────────────────────────────────────
+
+def transcribe_audio(video_path):
+    base, _ = os.path.splitext(video_path)
+    audio_path = base + "_temp_audio.wav"
+
     video = VideoFileClip(video_path)
     video.audio.write_audiofile(audio_path, fps=16000, nbytes=2, codec='pcm_s16le')
     video.close()
 
-    model = WhisperModel("base", device="cpu",compute_type="float32")  # change to cuda if GPU
+    model = WhisperModel(config.WHISPER_MODEL, device=config.WHISPER_DEVICE,
+                         compute_type=config.WHISPER_COMPUTE_TYPE)
     segments, _ = model.transcribe(audio_path)
 
     transcript_segments = []
@@ -76,67 +132,157 @@ def transcribe_audio(video_path):
 
     return transcript_segments
 
-def get_speech_peaks(transcript_segments, window_size=4):
-    """
-    Detect excitement via speech speed increase
-    Returns timestamps where speech is fast
-    """
-    speech_peaks = []
 
+# ──────────────────────────────────────────────
+# Event type classification
+# ──────────────────────────────────────────────
+
+def classify_event(label, run_diff=0, wicket_diff=0, transcript_text=""):
+    """
+    Classify a highlight into a cricket event type based on detection source,
+    score changes, and transcript keywords.
+    Returns one of: "six", "boundary", "wicket", "catch", "replay", or the original label.
+    """
+    text_lower = transcript_text.lower()
+
+    # Score-change events are the most reliable
+    if label == "score_change":
+        if wicket_diff > 0:
+            # Check if it's specifically a catch from transcript
+            if any(kw in text_lower for kw in config.CATCH_KEYWORDS):
+                return "catch"
+            return "wicket"
+        if run_diff >= config.OCR_RUN_DIFF_SIX:
+            return "six"
+        if run_diff >= config.OCR_RUN_DIFF_BOUNDARY:
+            return "boundary"
+
+    # Transcript keyword matching for other detection types
+    if any(kw in text_lower for kw in config.REPLAY_KEYWORDS):
+        return "replay"
+    if any(kw in text_lower for kw in config.SIX_KEYWORDS):
+        return "six"
+    if any(kw in text_lower for kw in config.WICKET_KEYWORDS):
+        return "wicket"
+    if any(kw in text_lower for kw in config.CATCH_KEYWORDS):
+        return "catch"
+    if any(kw in text_lower for kw in config.BOUNDARY_KEYWORDS):
+        return "boundary"
+
+    return label  # fallback to original detection label
+
+
+# ──────────────────────────────────────────────
+# Replay detection
+# ──────────────────────────────────────────────
+
+def detect_replay_frames(video_path, sample_interval=2):
+    """
+    Detect replay sequences in WCC3 footage.
+    Replays typically show:
+      1. A brief dark flash / wipe transition before and after
+      2. Camera angle change (wider shot vs close-up)
+      3. Sometimes a 'REPLAY' text watermark
+
+    Returns list of (start_time, end_time) for detected replay segments.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+
+    replays = []
+    prev_brightness = None
+    in_replay = False
+    replay_start = 0
+
+    for t_sec in range(0, int(duration), sample_interval):
+        frame_idx = int(t_sec * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        brightness = np.mean(gray)
+
+        # Detect dark flash (brightness drop below 30)
+        if prev_brightness is not None:
+            brightness_drop = prev_brightness - brightness
+
+            if brightness_drop > 60 and not in_replay:
+                # Sharp brightness drop = potential replay start
+                in_replay = True
+                replay_start = t_sec
+            elif in_replay and brightness_drop < -40:
+                # Brightness recovery = replay end
+                replay_duration = t_sec - replay_start
+                if 2 < replay_duration < 15:
+                    replays.append((replay_start, t_sec))
+                in_replay = False
+
+        # Also check for "REPLAY" text via OCR on a small region
+        h, w = frame.shape[:2]
+        top_strip = frame[0:h // 8, w // 4: 3 * w // 4]
+        try:
+            text = pytesseract.image_to_string(top_strip, config='--psm 7').strip().upper()
+            if "REPLAY" in text or "ACTION REPLAY" in text:
+                if not in_replay:
+                    in_replay = True
+                    replay_start = t_sec
+        except Exception:
+            pass
+
+        prev_brightness = brightness
+
+    # Close any open replay at end
+    if in_replay:
+        replay_duration = duration - replay_start
+        if 2 < replay_duration < 15:
+            replays.append((replay_start, duration))
+
+    cap.release()
+    print(f"Replay detection: found {len(replays)} replay segments")
+    return replays
+
+
+# ──────────────────────────────────────────────
+# Peak detection functions
+# ──────────────────────────────────────────────
+
+def get_speech_peaks(transcript_segments):
+    """Detect excitement via speech speed increase."""
+    speech_peaks = []
     for segment in transcript_segments:
         duration = segment["end"] - segment["start"]
         if duration <= 0:
             continue
-
         wps = segment["word_count"] / duration
-
-        # If speech faster than threshold → possible excitement
-        if wps > 3.5:   # tune this
+        if wps > config.SPEECH_WPS_THRESHOLD:
             speech_peaks.append(segment["start"])
-
     return speech_peaks
 
-def get_audio_peaks(video_path, window_size=0.5, threshold=0.05):
-    """
-    Detect times in the video where audio amplitude spikes (crowd cheers / celebrations)
-    Returns a list of times in seconds
-    """
+
+def get_audio_peaks(video_path):
+    """Detect times where audio amplitude spikes (crowd cheers / celebrations)."""
     video = VideoFileClip(video_path)
     audio = video.audio
     duration = video.duration
-    times = [] 
-    # step = window_size
+    times = []
     t = 0
     while t < duration:
-        segment = audio.subclipped(t, min(t+window_size, duration))
+        segment = audio.subclipped(t, min(t + config.AUDIO_WINDOW_SIZE, duration))
         samples = segment.to_soundarray(fps=44100)
         amplitude = np.mean(np.abs(samples))
-        if amplitude > threshold:
+        if amplitude > config.AUDIO_AMPLITUDE_THRESHOLD:
             times.append(t)
-        t += window_size
-    print(f"DEBUG: max audio_peak={max(times) if times else 'none'}")
+        t += config.AUDIO_WINDOW_SIZE
     video.close()
     return times
-    
-    mp_face = mp.solutions.face_detection
-    face_detection = mp_face.FaceDetection()
-    cap = cv2.VideoCapture("clip.mp4")
 
-    ret, frame = cap.read()
-    results = face_detection.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-    if results.detections:
-        bbox = results.detections[0].location_data.relative_bounding_box
-    x = bbox.xmin
-    y = bbox.ymin
-    w = bbox.width
-    h = bbox.height
-
-def get_visual_peaks(video_path, threshold=25):
-    """
-    Detect frames where visual changes occur (big six text, celebration flashes)
-    Returns list of frame indices and FPS
-    """
+def get_visual_peaks(video_path):
+    """Detect frames where visual changes occur (big six text, celebration flashes)."""
     cap = cv2.VideoCapture(video_path)
     prev_frame = None
     highlights = []
@@ -149,15 +295,13 @@ def get_visual_peaks(video_path, threshold=25):
             break
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        # Crop area where big six / celebration text appears (tune for your video)
         h, w = gray.shape
-        roi = gray[int(0.75*h):h, int(0.2*w):int(0.8*w)]
+        roi = gray[int(0.75 * h):h, int(0.2 * w):int(0.8 * w)]
 
         if prev_frame is not None:
             diff = cv2.absdiff(prev_frame, roi)
-            score = np.sum(diff) / (roi.shape[0] * roi.shape[1])  # normalize
-            if score > threshold:
+            score = np.sum(diff) / (roi.shape[0] * roi.shape[1])
+            if score > config.VISUAL_CHANGE_THRESHOLD:
                 highlights.append(frame_idx)
 
         prev_frame = roi
@@ -166,25 +310,26 @@ def get_visual_peaks(video_path, threshold=25):
     cap.release()
     return highlights, fps
 
+
 def get_ocr_peaks(video_path):
     """
-    Detect highlights from scoreboard changes using OCR
-    Returns list of timestamps in seconds
+    Detect highlights from scoreboard changes using OCR.
+    Returns list of (timestamp, run_diff, wicket_diff) tuples for event classification.
     """
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
-    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
+    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps if fps > 0 else 0
     prev_score = None
     peaks = []
 
-    for t in range(0, int(duration), 1):  # every 1 sec
+    for t in range(0, int(duration), config.OCR_SAMPLE_INTERVAL):
         cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         success, frame = cap.read()
         if not success:
             continue
 
         h, w, _ = frame.shape
-        scoreboard = frame[int(0.75*h):h, int(0.2*w):int(0.8*w)]
+        scoreboard = frame[int(0.75 * h):h, int(0.2 * w):int(0.8 * w)]
         gray_scoreboard = cv2.cvtColor(scoreboard, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray_scoreboard, 150, 255, cv2.THRESH_BINARY)
         score_text = pytesseract.image_to_string(thresh, config='--psm 7')
@@ -197,124 +342,107 @@ def get_ocr_peaks(video_path):
             prev_runs, prev_wickets = prev_score
             run_diff = runs - prev_runs
             wicket_diff = wickets - prev_wickets
-            if run_diff >= 4 or wicket_diff > 0:
-                peaks.append(t)  # timestamp in seconds
+            if run_diff >= config.OCR_RUN_DIFF_BOUNDARY or wicket_diff > 0:
+                peaks.append((t, run_diff, wicket_diff))
         prev_score = (runs, wickets)
 
     cap.release()
     return peaks
 
-def merge_peaks(audio_times, visual_times, ocr_times,speech_times, video_duration):
-    """
-    Merge audio and visual peaks into final highlight timestamps
-    Returns list of tuples: (start_time, end_time)
-    """
 
-    # for t in strong_times:
-    #     if t > video_duration + 5:
-    #         print(f"❌ BAD TIME DETECTED: {t} (probably frame number)")
-    #         continue
-    # ---------- STEP 1: Combine detections with score ----------
+# ──────────────────────────────────────────────
+# Merge peaks
+# ──────────────────────────────────────────────
+
+def merge_peaks(audio_times, visual_times, ocr_peaks, speech_times,
+                video_duration, transcript_segments=None, format_type="reel"):
+    """
+    Merge all detection signals into final highlight timestamps.
+    Returns list of tuples: (start_time, end_time, event_type)
+    where event_type is a classified cricket event like "six", "wicket", etc.
+    """
     candidates = []
 
     for t in audio_times:
-        candidates.append((t, 1.0, "crowd"))   # crowd cheer = strong
+        candidates.append((t, config.CONFIDENCE_CROWD, "crowd", 0, 0))
 
     for t in visual_times:
-        candidates.append((t, 0.9, "motion"))   # motion = medium
+        candidates.append((t, config.CONFIDENCE_MOTION, "motion", 0, 0))
 
-    for t in ocr_times:
-        candidates.append((t, 0.95, "score_change"))   # score change = VERY strong
+    # OCR peaks now carry run_diff and wicket_diff for classification
+    for t, run_diff, wicket_diff in ocr_peaks:
+        candidates.append((t, config.CONFIDENCE_SCORE_CHANGE, "score_change", run_diff, wicket_diff))
+
     for t in speech_times:
-        candidates.append((t, 0.85, "speech_excitement"))
-    # Fallback so system never returns empty
-    if not candidates and audio_times:
-        print(" No strong detections — using audio fallback")
-        candidates = [(t, 2) for t in audio_times]
+        candidates.append((t, config.CONFIDENCE_SPEECH, "speech_excitement", 0, 0))
 
     if not candidates:
-        print(" No highlights possible")
+        print("No highlights detected from any source")
         return []
 
-    # ---------- STEP 2: Sort by time ----------
     candidates.sort(key=lambda x: x[0])
 
-    PRE_ROLL = 2     # seconds before action (buildup)
-    POST_ROLL = 3     # after action (reaction)
-    # MIN_GAP = 8       # minimum gap between highlights
-    highlights = []
-    # last_added = -10  # to avoid duplicates within 10 seconds
-
-    # ---------- STEP 3: Remove nearby duplicates ----------
+    # Group nearby events
     grouped_events = []
     current_group = [candidates[0]]
 
-    for t, score, label in candidates[1:]:
-        # If event within 4 seconds → same moment
-        if t - current_group[-1][0] <= 2:
-            current_group.append((t, score, label))
+    for entry in candidates[1:]:
+        if entry[0] - current_group[-1][0] <= config.MERGE_GROUP_WINDOW:
+            current_group.append(entry)
         else:
             grouped_events.append(current_group)
-            current_group = [(t, score, label)]
-
+            current_group = [entry]
     grouped_events.append(current_group)
-    if label == "scene":
-        score = 0.5
 
-    # ---------- STEP 4: Keep only important events ----------
-    
-    events = []
-    used_labels = set()
-    balanced_times = []
+    # Pick best event from each group
+    best_events = []
     for group in grouped_events:
-        best_event = max(group, key=lambda x: x[1])  # (t, score, label)
-        t, score, label = best_event
+        best = max(group, key=lambda x: x[1])
+        best_events.append(best)
 
-        if label in used_labels:
-            continue
-        balanced_times.append(t)  # Store (time, score, label)
-        used_labels.add(label)
+    # Sort by confidence, take top N
+    best_events.sort(key=lambda x: x[1], reverse=True)
+    max_clips = config.MAX_CLIPS_REEL if format_type == "reel" else config.MAX_CLIPS_YOUTUBE
+    top_events = best_events[:max_clips]
 
-    # sort by importance FIRST
-    events.sort(key=lambda x: x[1], reverse=True)
+    # Re-sort chronologically
+    top_events.sort(key=lambda x: x[0])
 
-    events = balanced_times[:5]  # keep strongest  # limit to top 6 highlights
+    print(f"{len(candidates)} candidates -> {len(grouped_events)} groups -> {len(top_events)} selected")
 
-    print("DEBUG candidates", candidates[:10])
-    print("DEBUG events", type(events[0]))
-    # ---------- STEP 5: Convert to clips ----------
-    for t, score, label in candidates:
-        start = max(0, t - PRE_ROLL)
-        end = min( video_duration, t + POST_ROLL)
-        highlights.append((start, end,label))
+    # Convert to clips with event classification
+    highlights = []
+    for t, score, label, run_diff, wicket_diff in top_events:
+        # Get transcript text near this timestamp for keyword classification
+        transcript_text = ""
+        if transcript_segments:
+            for seg in transcript_segments:
+                if seg["start"] <= t + config.POST_ROLL and seg["end"] >= t - config.PRE_ROLL:
+                    transcript_text += " " + seg["text"]
 
-        # if highlights and start <= highlights[-1][1]:
-        #     highlights[-1] = (highlights[-1][0], end)
-        # else:
-        #     highlights.append((start, end))
+        event_type = classify_event(label, run_diff, wicket_diff, transcript_text)
+        start = max(0, t - config.PRE_ROLL)
+        end = min(video_duration, t + config.POST_ROLL)
+        highlights.append((start, end, event_type))
+
+    # Remove overlapping clips
     filtered = []
     for h in highlights:
-        if not filtered or h[0] > filtered[-1][1]:  # no overlap
+        if not filtered or h[0] > filtered[-1][1]:
             filtered.append(h)
-    highlights = filtered
-    # ---------- STEP 6: Limit reel duration ----------
-    format_type = request.form.get("format", "reel")
-    if format_type == "reel":
-        highlights = highlights[:6]
-    else:
-        highlights = highlights[:20]
-    max_clips = 6   # 6 clips × ~6 sec = 36 sec reel
-    highlights = highlights[:max_clips]
 
-    print(f"Final highlights selected: {len(highlights)}")
-    return highlights
+    print(f"Final highlights selected: {len(filtered)}")
+    return filtered
 
 
+# ──────────────────────────────────────────────
+# Main entry point
+# ──────────────────────────────────────────────
 
-def find_highlights(video_path):
+def find_highlights(video_path, format_type="reel"):
     """
-    End-to-end highlight detection using audio + visual cues
-    Returns: list of (start_time, end_time)
+    End-to-end highlight detection using audio + visual + OCR + speech cues.
+    Returns: (highlight_times, layout_mode, transcript_segments)
     """
     print("Analyzing video for highlights...")
 
@@ -325,12 +453,11 @@ def find_highlights(video_path):
     scoreboard_frames = 0
     checked_frames = 0
 
-    for i in range(0, frame_count, int(fps)):  # 1 frame per second
+    for i in range(0, frame_count, max(1, int(fps))):
         cap.set(cv2.CAP_PROP_POS_FRAMES, i)
         ret, frame = cap.read()
         if not ret:
             break
-
         checked_frames += 1
         if detect_scoreboard(frame):
             scoreboard_frames += 1
@@ -338,39 +465,44 @@ def find_highlights(video_path):
     cap.release()
 
     scoreboard_ratio = scoreboard_frames / max(1, checked_frames)
+    layout_mode = "contain" if scoreboard_ratio > config.SCOREBOARD_RATIO_THRESHOLD else "verticalCrop"
 
-    if scoreboard_ratio > 0.3:
-        layout_mode = "contain"
-    else:
-        layout_mode = "verticalCrop"
-    
     video = VideoFileClip(video_path)
     video_duration = video.duration
-    print(f"DEBUG: video.duration={video_duration}")
+    print(f"Video duration: {video_duration:.1f}s")
 
     audio_peaks = get_audio_peaks(video_path)
-    visual_frames, fps = get_visual_peaks(video_path)
-    visual_times = [f / fps for f in visual_frames]
-    ocr_times = get_ocr_peaks(video_path)
-    # NEW AI TRANSCRIPTION
+    visual_frames, vid_fps = get_visual_peaks(video_path)
+    visual_times = [f / vid_fps for f in visual_frames] if vid_fps > 0 else []
+    ocr_peaks = get_ocr_peaks(video_path)
+
     print("Running Whisper transcription...")
     transcript_segments = transcribe_audio(video_path)
 
-    # NEW speech excitement detection
     speech_peaks = get_speech_peaks(transcript_segments)
-    print(f"Speech peaks detected: {len(speech_peaks)}")
-    print(f"DEBUG: max audio_peak={max(audio_peaks) if audio_peaks else 'none'}")
-    print(f"DEBUG: max visual_time={max(visual_times) if visual_times else 'none'}")
-    print(f"DEBUG: max ocr_time={max(ocr_times) if ocr_times else 'none'}")
-    print(f"DEBUG: video.duration={video_duration}")
-    highlight_times = merge_peaks(audio_peaks, visual_times, ocr_times,speech_peaks, video_duration)
 
-    print(f"Found {len(highlight_times)} highlights.")
-    for idx, (start, end, label) in enumerate(highlight_times, 1):
-        print(f"{idx}. Start: {start}s  End: {end}s  Type: {label}")
-    print("🔥 RETURNING highlight_times from find_highlights():")
-    for h in highlight_times[:10]:
-        print(h)
+    # Detect replay segments
+    replay_segments = detect_replay_frames(video_path)
+
+    print(f"Peaks found - audio: {len(audio_peaks)}, visual: {len(visual_times)}, "
+          f"ocr: {len(ocr_peaks)}, speech: {len(speech_peaks)}, replays: {len(replay_segments)}")
+
+    highlight_times = merge_peaks(
+        audio_peaks, visual_times, ocr_peaks, speech_peaks,
+        video_duration, transcript_segments=transcript_segments,
+        format_type=format_type
+    )
+
+    # Mark highlights that fall within replay segments
+    for i, (start, end, event_type) in enumerate(highlight_times):
+        for r_start, r_end in replay_segments:
+            if start >= r_start and end <= r_end and event_type not in ("six", "wicket", "catch", "boundary"):
+                highlight_times[i] = (start, end, "replay")
+                break
+
+    print(f"Found {len(highlight_times)} highlights:")
+    for idx, (start, end, event_type) in enumerate(highlight_times, 1):
+        print(f"  {idx}. {start:.1f}s - {end:.1f}s  [{event_type}]")
 
     video.close()
-    return highlight_times,layout_mode
+    return highlight_times, layout_mode, transcript_segments

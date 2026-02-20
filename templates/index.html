@@ -5,14 +5,17 @@
     <style>
       body {
         margin: 0;
-        height: 100vh;
+        min-height: 100vh;
         display: flex;
         justify-content: center;
-        align-items: center;
+        align-items: flex-start;
+        padding: 40px 20px;
+        box-sizing: border-box;
         background: url("static/WCC3_BG.jpg");
         background-position: center;
         background-repeat: no-repeat;
         background-size: cover;
+        background-attachment: fixed;
         font-family: Arial, sans-serif;
         color: white;
       }
@@ -23,6 +26,8 @@
         padding: 40px;
         border-radius: 15px;
         box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+        width: 100%;
+        max-width: 520px;
       }
 
       h2 {
@@ -51,16 +56,69 @@
           box-shadow 0.2s ease;
       }
 
-      button:hover {
+      button:hover:not(:disabled) {
         transform: scale(1.1);
         box-shadow: 0 0 15px #ff512f;
+      }
+
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+
+      /* Progress UI */
+      #progressContainer {
+        display: none;
+        margin: 20px 0;
+        text-align: left;
+      }
+
+      #stepText {
+        font-size: 14px;
+        margin-bottom: 8px;
+        color: #f0f0f0;
+        min-height: 20px;
+      }
+
+      .progress-track {
+        background: rgba(255, 255, 255, 0.15);
+        border-radius: 10px;
+        overflow: hidden;
+        height: 22px;
+        position: relative;
+      }
+
+      #progressBar {
+        width: 0%;
+        height: 100%;
+        background: linear-gradient(90deg, #ff512f, #dd2476);
+        border-radius: 10px;
+        transition: width 0.5s ease;
+      }
+
+      #progressPercent {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 12px;
+        font-weight: bold;
+        color: white;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.5);
+      }
+
+      #timeRemaining {
+        font-size: 12px;
+        margin-top: 6px;
+        color: #aaa;
+        min-height: 18px;
       }
     </style>
   </head>
 
   <body>
     <div class="container">
-      <h2>🏏 AI WCC3 Highlight Generator</h2>
+      <h2>AI WCC3 Highlight Generator</h2>
       <form
         id="uploadForm"
         action="/upload"
@@ -74,41 +132,135 @@
         >
           <label>
             <select name="format" required>
-              <option value="reel" selected>📱 Instagram Reel (9:16)</option>
-              <option value="youtube">▶️ YouTube Video (16:9)</option>
+              <option value="reel" selected>Instagram Reel (9:16)</option>
+              <option value="youtube">YouTube Video (16:9)</option>
             </select>
           </label>
           <br />
         </div>
+
+        <!-- Progress UI -->
+        <div id="progressContainer">
+          <div id="stepText">Starting...</div>
+          <div class="progress-track">
+            <div id="progressBar"></div>
+            <span id="progressPercent">0%</span>
+          </div>
+          <div id="timeRemaining"></div>
+        </div>
+
         <video
           id="resultVideo"
           controls
-          style="margin-top: 20px; width: 100%; display: none"
+          style="margin-top: 20px; max-height: 480px; max-width: 100%; border-radius: 10px; display: none; margin-left: auto; margin-right: auto"
         ></video>
-        <script>
-          document.getElementById("uploadForm").onsubmit = async (e) => {
-            e.preventDefault();
 
-            const formData = new FormData(e.target);
-            const res = await fetch("/upload", {
-              method: "POST",
-              body: formData,
-            });
-            const data = await res.json();
-            if (data.error) {
-              alert(data.error);
-              return;
-            }
-            if (data.video_url) {
-              const video = document.getElementById("resultVideo");
-              video.src = data.video_url;
-              video.style.display = "block";
-            }
-          };
-        </script>
         <br />
-        <button type="submit">🚀 Generate Highlights</button>
+        <button id="submitBtn" type="submit">Generate Highlights</button>
       </form>
     </div>
+
+    <script>
+      function formatTime(seconds) {
+        seconds = Math.round(seconds);
+        if (seconds < 60) return seconds + "s";
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return mins + "m " + secs + "s";
+      }
+
+      document.getElementById("uploadForm").onsubmit = async (e) => {
+        e.preventDefault();
+
+        const progressContainer = document.getElementById("progressContainer");
+        const progressBar = document.getElementById("progressBar");
+        const progressPercent = document.getElementById("progressPercent");
+        const stepText = document.getElementById("stepText");
+        const timeRemaining = document.getElementById("timeRemaining");
+        const submitBtn = document.getElementById("submitBtn");
+        const video = document.getElementById("resultVideo");
+
+        // Reset and show progress UI
+        progressContainer.style.display = "block";
+        video.style.display = "none";
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Processing...";
+        progressBar.style.width = "0%";
+        progressBar.style.background = "linear-gradient(90deg, #ff512f, #dd2476)";
+        progressPercent.textContent = "0%";
+        stepText.textContent = "Starting...";
+        timeRemaining.textContent = "";
+
+        const formData = new FormData(e.target);
+
+        try {
+          const res = await fetch("/upload", {
+            method: "POST",
+            body: formData,
+          });
+
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop(); // keep incomplete last line
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+
+              try {
+                const event = JSON.parse(line);
+
+                if (event.type === "progress") {
+                  progressBar.style.width = event.percent + "%";
+                  progressPercent.textContent = event.percent + "%";
+                  stepText.textContent = event.stepText;
+
+                  if (event.estimatedRemaining > 0) {
+                    timeRemaining.textContent =
+                      "~" + formatTime(event.estimatedRemaining) + " remaining";
+                  } else {
+                    timeRemaining.textContent = "Estimating time...";
+                  }
+                } else if (event.type === "complete") {
+                  progressBar.style.width = "100%";
+                  progressPercent.textContent = "100%";
+                  stepText.textContent = "Done!";
+                  timeRemaining.textContent =
+                    "Completed in " + formatTime(event.elapsed);
+
+                  if (event.videoUrl) {
+                    video.src = event.videoUrl;
+                    video.style.display = "block"; // block enables margin auto centering
+                    video.scrollIntoView({ behavior: "smooth", block: "center" });
+                  }
+                } else if (event.type === "error") {
+                  stepText.textContent = "Error: " + event.message;
+                  progressBar.style.width = "100%";
+                  progressBar.style.background = "#e74c3c";
+                  progressPercent.textContent = "";
+                  timeRemaining.textContent = "";
+                }
+              } catch (parseErr) {
+                console.warn("Failed to parse event:", line, parseErr);
+              }
+            }
+          }
+        } catch (err) {
+          stepText.textContent = "Connection error: " + err.message;
+          progressBar.style.background = "#e74c3c";
+          timeRemaining.textContent = "";
+        } finally {
+          submitBtn.disabled = false;
+          submitBtn.textContent = "Generate Highlights";
+        }
+      };
+    </script>
   </body>
 </html>

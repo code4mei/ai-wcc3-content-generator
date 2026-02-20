@@ -27,13 +27,15 @@ export const AnimatedText: React.FC<Props> = ({ caption }) => {
     frame,
     [0, 15],
     [0, 1],
-    { extrapolateLeft: "clamp" }
+    { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
   );
-  const translateY = interpolate(frame, [0, 15], [20,0],{
-  extrapolateRight: "clamp",
+  const translateY = interpolate(frame, [0, 15], [20, 0], {
+    extrapolateRight: "clamp",
   });
   const fontSize = getFontSize(caption.text);
-  const blur = interpolate(frame, [0, 6], [8,0]);
+  const blur = interpolate(frame, [0, 6], [8, 0], {
+    extrapolateRight: "clamp",
+  });
 
   // Split long text into max 2 lines for balanced layout
   const words = caption.text.split(" ");
